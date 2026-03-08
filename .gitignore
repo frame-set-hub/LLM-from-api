@@ -1,0 +1,9 @@
+# Secrets — never commit
+.env
+
+# Build artifacts
+llm-chat
+*.test
+
+# OS cruft
+.DS_Store
