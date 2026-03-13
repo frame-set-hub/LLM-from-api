@@ -24,15 +24,28 @@
 ├── .env                        secrets (NEVER commit)
 ├── .env.example                template (always commit)
 ├── .gitignore
+├── .claude/
+│   ├── CLAUDE.md               this file
+│   ├── settings.local.json     local permissions (git-ignored)
+│   └── commands/               custom slash commands
+│       ├── test.md             /test — run all tests
+│       ├── build.md            /build — compile project
+│       ├── lint.md             /lint — go vet + gofmt
+│       ├── review.md           /review — review uncommitted changes
+│       ├── coverage.md         /coverage — test coverage report
+│       └── structure.md        /structure — show project architecture
 ├── go.mod / go.sum
-├── main.go                     CLI entry: env loading, REPL loop, slash commands
+├── main.go                     CLI entry: env loading, REPL loop, slash commands, UI
 ├── README.md                   human-facing quick-start
-├── CLAUDE.md                   this file
 └── internal/
     ├── anthropic/
-    │   └── client.go           SSE streaming client — content blocks, image helpers
-    └── chat/
-        └── session.go          stateful session: Stream(), StreamWithImage(), History()
+    │   ├── client.go           SSE streaming client — content blocks, image helpers
+    │   └── client_test.go      tests: mock SSE server, headers, errors, cancellation
+    ├── chat/
+    │   └── session.go          stateful session: Stream(), StreamWithImage(), History()
+    └── fileutil/
+        ├── fileutil.go         path resolution, @mention injection, quoted paths, dir listing
+        └── fileutil_test.go    tests: resolve paths, inject files, format sizes
 ```
 
 ---
@@ -45,14 +58,19 @@ main.go
   ├── godotenv.Load()             load .env → os.Getenv
   ├── anthropic.New(cfg)          build HTTP client
   ├── chat.NewSession(client)     create session with empty history
+  ├── signal.NotifyContext()      graceful shutdown on Ctrl+C / SIGTERM
   │
-  └── REPL loop
+  └── REPL loop (ctx-aware)
         │
         ├── read line from stdin
         ├── handle slash commands locally:
-        │     /image <path> [caption]  → session.StreamWithImage(ctx, path, caption, onToken)
-        │     /reset /history /help /quit
-        └── normal text input          → session.Stream(ctx, input, onToken)
+        │     /file <path> [question]  → fileutil.InjectFile → send as text
+        │     /image <path> [caption]  → session.StreamWithImage(ctx, ...)
+        │     /dir /cd /reset /history /usage /help /quit
+        ├── file injection:
+        │     @mention             → fileutil.ResolveAtMentions
+        │     '/path' or "/path"   → fileutil.ResolveQuotedPaths
+        └── normal text input      → session.Stream(ctx, input, onToken)
               │
               ├── append user Message to history
               ├── anthropic.Client.Stream(ctx, history, systemPrompt, onToken)
@@ -60,7 +78,8 @@ main.go
               │     ├── headers: x-api-key, anthropic-version, content-type
               │     ├── parse SSE lines: "data: {...}"
               │     ├── call onToken(delta) for each content_block_delta
-              │     └── return accumulated full text + error
+              │     ├── drain resp.Body on close (connection reuse)
+              │     └── return accumulated full text + usage + error
               ├── append assistant Message to history
               └── return to REPL
 ```
@@ -136,6 +155,10 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 | `godotenv.Load()` non-fatal | Binary still works if deployed with OS env vars only |
 | `internal/` packages | Hides implementation; only `main.go` is the public surface |
 | `requireEnv()` helper | Fails fast with a clear message if a required var is missing |
+| Graceful shutdown via context | Ctrl+C cancels in-flight HTTP requests cleanly |
+| Drain `resp.Body` before close | Ensures HTTP connection reuse via keep-alive |
+| SSE scanner with 256KB buffer | Prevents OOM from unexpectedly long SSE lines |
+| `fileutil` package | Separates path/file logic from REPL — testable in isolation |
 
 ---
 
@@ -151,7 +174,26 @@ go build -o llm-chat .
 
 # With override
 LLM_MODEL=other-model go run .
+
+# Run tests
+go test ./... -v
+
+# Test coverage
+go test ./... -coverprofile=coverage.out && go tool cover -func=coverage.out
 ```
+
+---
+
+## Claude Code Custom Commands
+
+| Command | Description |
+|---|---|
+| `/test` | Run all tests with verbose output |
+| `/build` | Compile and report errors |
+| `/lint` | `go vet` + `gofmt` checks |
+| `/review` | Review uncommitted changes |
+| `/coverage` | Test coverage analysis |
+| `/structure` | Show project architecture |
 
 ---
 
@@ -178,7 +220,7 @@ LLM_MODEL=other-model go run .
 github.com/joho/godotenv v1.5.1   — .env file loader (only external dep)
 ```
 
-Everything else: Go stdlib (`net/http`, `encoding/json`, `bufio`, `os`, `encoding/base64`).
+Everything else: Go stdlib (`net/http`, `encoding/json`, `bufio`, `os`, `encoding/base64`, `context`, `os/signal`).
 
 ---
 
@@ -188,3 +230,5 @@ Everything else: Go stdlib (`net/http`, `encoding/json`, `bufio`, `os`, `encodin
 - Error handling: wrap with `fmt.Errorf("context: %w", err)` everywhere.
 - No global state — config flows through struct fields.
 - Test files go beside source files: `client_test.go` next to `client.go`.
+- `Session` is **not** safe for concurrent use — document if exposing via REST.
+- Always update `README.md` and this file when changing code structure.
