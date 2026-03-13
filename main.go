@@ -6,12 +6,13 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"regexp"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"llm-chat/internal/anthropic"
 	"llm-chat/internal/chat"
+	"llm-chat/internal/fileutil"
 
 	"github.com/joho/godotenv"
 )
@@ -21,13 +22,6 @@ import (
 // ---------------------------------------------------------------------------
 
 const systemPrompt = "You are a helpful assistant."
-
-// atPattern matches @filename or @/absolute/path tokens in user input.
-var atPattern = regexp.MustCompile(`@([^\s]+)`)
-
-// quotedPathPattern matches 'path' or "path" where path starts with / or ~/
-// This covers drag-and-drop file paths on macOS.
-var quotedPathPattern = regexp.MustCompile(`['"]((~|\/)[^'"]+)['"]`)
 
 func main() {
 	if err := godotenv.Load(); err != nil {
@@ -42,6 +36,10 @@ func main() {
 	client := anthropic.New(cfg)
 	session := chat.NewSession(client, systemPrompt)
 
+	// Graceful shutdown: Ctrl+C cancels in-flight requests.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
 	// Working directory — files referenced by @name resolve relative to this.
 	workDir, err := os.Getwd()
 	if err != nil {
@@ -51,7 +49,7 @@ func main() {
 	printBanner(model, baseURL, workDir)
 
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 
 	for {
 		fmt.Print("\nYou: ")
@@ -83,21 +81,24 @@ func main() {
 			printHistory(session)
 			continue
 
+		case input == "/usage":
+			printUsage(session)
+			continue
+
 		case input == "/help":
 			printHelp()
 			continue
 
 		case strings.HasPrefix(input, "/dir"):
-			// /dir [path]
 			target := workDir
 			if parts := strings.Fields(input); len(parts) >= 2 {
-				target = resolvePath(parts[1], workDir)
+				target = fileutil.ResolvePath(parts[1], workDir)
 			}
-			printDir(target)
+			fileutil.PrintDir(target)
 			continue
 
 		case strings.HasPrefix(input, "/cd "):
-			newDir := resolvePath(strings.TrimPrefix(input, "/cd "), workDir)
+			newDir := fileutil.ResolvePath(strings.TrimPrefix(input, "/cd "), workDir)
 			if info, err := os.Stat(newDir); err != nil || !info.IsDir() {
 				fmt.Fprintf(os.Stderr, "[error] not a directory: %s\n", newDir)
 			} else {
@@ -107,15 +108,14 @@ func main() {
 			continue
 
 		case strings.HasPrefix(input, "/file "):
-			// /file <path> [question...]  — explicit file attach
 			args := strings.TrimPrefix(input, "/file ")
 			parts := strings.SplitN(args, " ", 2)
-			path := resolvePath(parts[0], workDir)
+			path := fileutil.ResolvePath(parts[0], workDir)
 			question := ""
 			if len(parts) == 2 {
 				question = parts[1]
 			}
-			expanded, err := injectFile(path, question)
+			expanded, err := fileutil.InjectFile(path, question)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 				continue
@@ -123,16 +123,15 @@ func main() {
 			input = expanded
 
 		case strings.HasPrefix(input, "/image "):
-			// /image <path> [caption...]
 			args := strings.TrimPrefix(input, "/image ")
 			parts := strings.SplitN(args, " ", 2)
-			imagePath := resolvePath(parts[0], workDir)
+			imagePath := fileutil.ResolvePath(parts[0], workDir)
 			caption := ""
 			if len(parts) == 2 {
 				caption = parts[1]
 			}
 			fmt.Print("\nAssistant: ")
-			if err := session.StreamWithImage(context.Background(), imagePath, caption, func(tok string) {
+			if err := session.StreamWithImage(ctx, imagePath, caption, func(tok string) {
 				fmt.Print(tok)
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "\n[error] %v\n", err)
@@ -144,12 +143,12 @@ func main() {
 		// ---------------------------------------------------------------
 		// File injection: @mention  or  '/path/file'  or  "/path/file"
 		// ---------------------------------------------------------------
-		resolved, injected, err := resolveAtMentions(input, workDir)
+		resolved, injected, err := fileutil.ResolveAtMentions(input, workDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 			continue
 		}
-		resolved, injected2 := resolveQuotedPaths(resolved, workDir)
+		resolved, injected2 := fileutil.ResolveQuotedPaths(resolved, workDir)
 		injected = injected || injected2
 		if injected {
 			fmt.Printf("[injected file context into message]\n")
@@ -159,9 +158,13 @@ func main() {
 		// Send to model — streaming
 		// ---------------------------------------------------------------
 		fmt.Print("\nAssistant: ")
-		if err := session.Stream(context.Background(), resolved, func(tok string) {
+		if err := session.Stream(ctx, resolved, func(tok string) {
 			fmt.Print(tok)
 		}); err != nil {
+			if ctx.Err() != nil {
+				fmt.Println("\n[interrupted — shutting down]")
+				return
+			}
 			fmt.Fprintf(os.Stderr, "\n[error] %v\n", err)
 		}
 		fmt.Println()
@@ -170,154 +173,6 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "scanner error: %v\n", err)
 		os.Exit(1)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// File helpers
-// ---------------------------------------------------------------------------
-
-// resolvePath resolves p relative to workDir if it is not absolute.
-func resolvePath(p, workDir string) string {
-	if filepath.IsAbs(p) {
-		return p
-	}
-	// Support ~ for home directory.
-	if strings.HasPrefix(p, "~/") {
-		home, _ := os.UserHomeDir()
-		p = filepath.Join(home, p[2:])
-		return p
-	}
-	return filepath.Join(workDir, p)
-}
-
-// injectFile reads a file and wraps its content in a clear fenced block.
-func injectFile(path, question string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read file %q: %w", path, err)
-	}
-	ext := strings.TrimPrefix(filepath.Ext(path), ".")
-	block := fmt.Sprintf("[File: %s]\n```%s\n%s\n```", filepath.Base(path), ext, string(data))
-	if question != "" {
-		return block + "\n\n" + question, nil
-	}
-	return block, nil
-}
-
-// resolveAtMentions scans input for @path tokens, reads each file, and
-// replaces them with fenced code blocks.
-func resolveAtMentions(input, workDir string) (string, bool, error) {
-	matches := atPattern.FindAllStringSubmatchIndex(input, -1)
-	if len(matches) == 0 {
-		return input, false, nil
-	}
-
-	var sb strings.Builder
-	prev := 0
-	injected := false
-
-	for _, m := range matches {
-		fullStart, fullEnd := m[0], m[1]
-		rawPath := input[m[2]:m[3]]
-
-		path := resolvePath(rawPath, workDir)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			// Try appending common extensions (e.g. @main → @main.go)
-			data, path, err = tryExtensions(path)
-		}
-		if err != nil {
-			// Still not found — leave @token as-is.
-			sb.WriteString(input[prev:fullEnd])
-			prev = fullEnd
-			continue
-		}
-
-		ext := strings.TrimPrefix(filepath.Ext(path), ".")
-		block := fmt.Sprintf("[File: %s]\n```%s\n%s\n```", filepath.Base(path), ext, string(data))
-		sb.WriteString(input[prev:fullStart])
-		sb.WriteString(block)
-		prev = fullEnd
-		injected = true
-	}
-	sb.WriteString(input[prev:])
-	return sb.String(), injected, nil
-}
-
-// resolveQuotedPaths detects dragged-file paths like '/path/file' or "/path/file"
-// and replaces them with fenced file content blocks.
-func resolveQuotedPaths(input, workDir string) (string, bool) {
-	matches := quotedPathPattern.FindAllStringSubmatchIndex(input, -1)
-	if len(matches) == 0 {
-		return input, false
-	}
-
-	var sb strings.Builder
-	prev := 0
-	injected := false
-
-	for _, m := range matches {
-		fullStart, fullEnd := m[0], m[1]
-		rawPath := input[m[2]:m[3]]
-
-		path := resolvePath(rawPath, workDir)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			sb.WriteString(input[prev:fullEnd])
-			prev = fullEnd
-			continue
-		}
-
-		ext := strings.TrimPrefix(filepath.Ext(path), ".")
-		block := fmt.Sprintf("[File: %s]\n```%s\n%s\n```", filepath.Base(path), ext, string(data))
-		sb.WriteString(input[prev:fullStart])
-		sb.WriteString(block)
-		prev = fullEnd
-		injected = true
-	}
-	sb.WriteString(input[prev:])
-	return sb.String(), injected
-}
-
-// tryExtensions tries common source file extensions on a base path.
-func tryExtensions(base string) ([]byte, string, error) {
-	exts := []string{".go", ".py", ".js", ".ts", ".md", ".json", ".yaml", ".yml", ".sh", ".txt"}
-	for _, ext := range exts {
-		p := base + ext
-		if data, err := os.ReadFile(p); err == nil {
-			return data, p, nil
-		}
-	}
-	return nil, base, fmt.Errorf("file not found: %s", base)
-}
-
-// printDir lists the contents of a directory.
-func printDir(path string) {
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[error] cannot read directory: %v\n", err)
-		return
-	}
-	fmt.Printf("\n📁 %s\n", path)
-	for _, e := range entries {
-		if e.IsDir() {
-			fmt.Printf("  📂 %s/\n", e.Name())
-		} else {
-			info, _ := e.Info()
-			fmt.Printf("  📄 %-40s %s\n", e.Name(), formatSize(info.Size()))
-		}
-	}
-}
-
-func formatSize(b int64) string {
-	switch {
-	case b < 1024:
-		return fmt.Sprintf("%dB", b)
-	case b < 1024*1024:
-		return fmt.Sprintf("%.1fKB", float64(b)/1024)
-	default:
-		return fmt.Sprintf("%.1fMB", float64(b)/(1024*1024))
 	}
 }
 
@@ -373,6 +228,15 @@ func printHelp() {
 	fmt.Println("  /quit                   — exit")
 	fmt.Println()
 	fmt.Println("Tip: paths can be relative (to WorkDir), absolute, or start with ~/")
+}
+
+func printUsage(session *chat.Session) {
+	u := session.Usage()
+	fmt.Println()
+	fmt.Println("Token usage (this session):")
+	fmt.Printf("  Input  : %d tokens\n", u.InputTokens)
+	fmt.Printf("  Output : %d tokens\n", u.OutputTokens)
+	fmt.Printf("  Total  : %d tokens\n", u.Total())
 }
 
 func printHistory(session *chat.Session) {

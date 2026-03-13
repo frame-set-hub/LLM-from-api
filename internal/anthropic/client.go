@@ -133,14 +133,35 @@ type requestPayload struct {
 	Stream    bool      `json:"stream,omitempty"`
 }
 
+// Usage holds token counts from the API response.
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+}
+
+// Total returns the sum of input and output tokens.
+func (u Usage) Total() int { return u.InputTokens + u.OutputTokens }
+
 // SSE event payloads (minimal subset we parse)
 type streamEvent struct {
 	Type  string `json:"type"`
 	Index int    `json:"index"`
+	// content_block_delta
 	Delta *struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"delta,omitempty"`
+	// message_start
+	Message *struct {
+		Usage *struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage,omitempty"`
+	} `json:"message,omitempty"`
+	// message_delta
+	Usage *struct {
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage,omitempty"`
 	Error *apiError `json:"error,omitempty"`
 }
 
@@ -199,8 +220,8 @@ func New(cfg Config) *Client {
 
 // Stream sends the conversation to the model with stream:true and calls
 // onToken for each text delta as it arrives. It returns the full accumulated
-// reply text and any error.
-func (c *Client) Stream(ctx context.Context, messages []Message, systemPrompt string, onToken func(string)) (string, error) {
+// reply text, token usage, and any error.
+func (c *Client) Stream(ctx context.Context, messages []Message, systemPrompt string, onToken func(string)) (string, Usage, error) {
 	payload := requestPayload{
 		Model:     c.cfg.Model,
 		MaxTokens: c.cfg.MaxTokens,
@@ -211,13 +232,13 @@ func (c *Client) Stream(ctx context.Context, messages []Message, systemPrompt st
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
+		return "", Usage{}, fmt.Errorf("marshal request: %w", err)
 	}
 
 	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/v1/messages"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+		return "", Usage{}, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.cfg.APIKey)
@@ -225,9 +246,12 @@ func (c *Client) Stream(ctx context.Context, messages []Message, systemPrompt st
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("http request: %w", err)
+		return "", Usage{}, fmt.Errorf("http request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
 
 	// Non-2xx: read the body and return a clean error.
 	if resp.StatusCode != http.StatusOK {
@@ -236,18 +260,19 @@ func (c *Client) Stream(ctx context.Context, messages []Message, systemPrompt st
 			Error *apiError `json:"error"`
 		}
 		if json.Unmarshal(raw, &errResp) == nil && errResp.Error != nil {
-			return "", errResp.Error
+			return "", Usage{}, errResp.Error
 		}
-		return "", fmt.Errorf("unexpected status %d: %s", resp.StatusCode, raw)
+		return "", Usage{}, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, raw)
 	}
 
 	// Parse the SSE stream line by line.
 	var accumulated strings.Builder
+	var usage Usage
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// SSE lines look like: "data: {...}" or "event: ..." or blank lines.
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
@@ -258,24 +283,36 @@ func (c *Client) Stream(ctx context.Context, messages []Message, systemPrompt st
 
 		var ev streamEvent
 		if err := json.Unmarshal([]byte(jsonData), &ev); err != nil {
-			continue // skip malformed lines
+			continue
 		}
 
 		if ev.Error != nil {
-			return accumulated.String(), ev.Error
+			return accumulated.String(), usage, ev.Error
 		}
-		if ev.Type == "content_block_delta" && ev.Delta != nil && ev.Delta.Type == "text_delta" {
-			delta := ev.Delta.Text
-			accumulated.WriteString(delta)
-			if onToken != nil {
-				onToken(delta)
+		switch ev.Type {
+		case "message_start":
+			if ev.Message != nil && ev.Message.Usage != nil {
+				usage.InputTokens = ev.Message.Usage.InputTokens
+				usage.OutputTokens = ev.Message.Usage.OutputTokens
+			}
+		case "message_delta":
+			if ev.Usage != nil {
+				usage.OutputTokens = ev.Usage.OutputTokens
+			}
+		case "content_block_delta":
+			if ev.Delta != nil && ev.Delta.Type == "text_delta" {
+				delta := ev.Delta.Text
+				accumulated.WriteString(delta)
+				if onToken != nil {
+					onToken(delta)
+				}
 			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return accumulated.String(), fmt.Errorf("reading stream: %w", err)
+		return accumulated.String(), usage, fmt.Errorf("reading stream: %w", err)
 	}
 
-	return accumulated.String(), nil
+	return accumulated.String(), usage, nil
 }
